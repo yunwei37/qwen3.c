@@ -10,7 +10,7 @@ required, just follow the steps below and enjoy.**
 **New to AI, understand the basics of transformers but want to learn in depth how LLM inference works? qwen3.c runs LLMs using one easy-to-understand (relatively speaking!) file of C source with no dependencies. Once you've
 digested it and understand the data flow, you're there.**
 
-This project's starting point was Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama.c), which does single-file
+This project's starting point was Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c), which does single-file
 inference for LLaMA 2-compatible models. The LLaMA 2 architecture is now 2 years old (a lifetime in the field of AI) and is
 long superseded. This project aims to maintain the simplicity of llama2.c while supporting a frontier
 model architecture, with the goal of being both an up-to-date learning resource and also a great way to run the latest models locally.
