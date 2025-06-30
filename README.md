@@ -16,7 +16,7 @@ long superseded. This project aims to maintain the simplicity of llama2.c while 
 model architecture, with the goal of being both an up-to-date learning resource and also a great way to run the latest models locally.
 
 Despite being only around 1000 lines of C code with no dependencies, qwen3.c supports everything you need to
-enjoy running LLMs on standard hardware (no GPUs needed), including multi-CPU core operation, and support for Unicode/multi-language input and output, and thinking/reasoning models.
+enjoy running leading Qwen3-architecture LLMs on standard hardware (no GPUs needed), including multi-CPU core operation, support for Unicode/multi-language input and output, and thinking/reasoning models.
 
 qwen3.c includes a Python tool to process any Qwen3-architecture HuggingFace model, converting to qwen3.c's model format which uses Q8_0 quantization for a good trade-off between quality
 and performance.
