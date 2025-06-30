@@ -4,7 +4,8 @@
   <img src="assets/qwen3_c.jpg" width="300" height="300" alt="Cute Llama">
 </p>
 
-**Run inference for frontier models based on the Qwen3 architecture, like Qwen3-4B or DeepSeek-R1-0528-Qwen3-8B, on your local Linux/macOS/Windows machine.**
+**Run inference for frontier models based on the Qwen3 architecture, like Qwen3-4B or DeepSeek-R1-0528-Qwen3-8B, on your local Linux/macOS/Windows machine. No complicated configuration
+required, just follow the steps below and enjoy.**
 
 **New to AI, understand the basics of transformers but want to learn in depth how LLM inference works? qwen3.c runs LLMs using one easy-to-understand (relatively speaking!) file of C source with no dependencies. Once you've
 digested it and understand the data flow, you're there.**
