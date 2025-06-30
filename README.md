@@ -6,7 +6,7 @@
 
 **Run inference for frontier models based on the Qwen3 architecture, like Qwen3-4B or DeepSeek-R1-0528-Qwen3-8B, on your local Linux/macOS/Windows machine.**
 
-**New to AI but want to learn how transformers work in depth? qwen3.c runs LLMs using one easy-to-understand file of C source with no dependencies. Once you've
+**New to AI, understand the basics of transformers but want to learn in depth how LLM inference works? qwen3.c runs LLMs using one easy-to-understand (relatively speaking!) file of C source with no dependencies. Once you've
 digested it and understand the data flow, you're there.**
 
 This project's starting point was Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama.c), which does single-file
@@ -38,7 +38,7 @@ make openmp
 First, make sure `git` is set up with your HuggingFace credentials (now is a great time to create a
 HuggingFace account if you don't have one).
 
-Then, download any unquantized Qwen3-architecture model (i.e. not GGUF) from HuggingFace.
+Then, download any dense (no Mixture-of-Experts) unquantized (not GGUF) Qwen3-architecture model from HuggingFace.
 Unless you have lots of RAM, start with smaller models.
 
 Qwen3-4B is a great starting point:

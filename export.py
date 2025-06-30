@@ -312,7 +312,7 @@ def load_hf_model(model_path):
 
     with open(os.path.join(model_path, 'config.json'), 'r') as f:
         config_json = json.load(f)
-    
+
     config.dim = config_json["hidden_size"]
     config.n_layers = config_json["num_hidden_layers"]
     config.n_heads = config_json["num_attention_heads"]
@@ -331,7 +331,7 @@ def load_hf_model(model_path):
     model.tok_embeddings.weight = nn.Parameter(hf_dict["model.embed_tokens.weight"])
     model.norm.weight = nn.Parameter(hf_dict["model.norm.weight"])
 
-    model.tokenizer = AutoTokenizer.from_pretrained(".")
+    model.tokenizer = AutoTokenizer.from_pretrained(model_path)
     model.bos_token_id = config_json.get("bos_token_id", 0)
     model.eos_token_id = config_json.get("eos_token_id", 0)
 

@@ -16,6 +16,7 @@ class ModelArgs:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
+    head_dim: int = 128
     vocab_size: int = 32000
     hidden_dim: Optional[int] = None
     multiple_of: int = 256  # MLP hidden layer size will be multiple of
@@ -105,6 +106,11 @@ class Attention(nn.Module):
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        # New for Qwen3
+        self.lq = RMSNorm(self.head_dim, eps=args.norm_eps)
+        self.lk = RMSNorm(self.head_dim, eps=args.norm_eps)
+
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
