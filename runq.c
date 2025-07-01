@@ -23,6 +23,8 @@ int GS = 0; // group size global for quantization of the weights
 // Transformer model
 
 typedef struct {
+    int magic_number; // checkpoint magic number
+    int version; // file format version
     int dim; // transformer dimension
     int hidden_dim; // for ffn layers
     int n_layers; // number of layers
@@ -44,7 +46,6 @@ typedef struct {
     // token embedding table
     QuantizedTensor *q_tokens; // (vocab_size, dim)
     float* token_embedding_table; // same, but dequantized
-
     // weights for rmsnorms
     float* rms_att_weight; // (layer, dim) rmsnorm weights
     float* rms_ffn_weight; // (layer, dim)
@@ -53,6 +54,9 @@ typedef struct {
     QuantizedTensor *wk; // (layer, dim, n_kv_heads * head_size)
     QuantizedTensor *wv; // (layer, dim, n_kv_heads * head_size)
     QuantizedTensor *wo; // (layer, n_heads * head_size, dim)
+    // QK-RMSNorm for Qwen3
+    float* q_ln_weights;
+    float* k_ln_weights;
     // weights for ffn
     QuantizedTensor *w1; // (layer, hidden_dim, dim)
     QuantizedTensor *w2; // (layer, dim, hidden_dim)
@@ -61,25 +65,22 @@ typedef struct {
     float* rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
     QuantizedTensor *wcls;
-    // QK-RMSNorm for Qwen3
-    float* q_ln_weights;
-    float* k_ln_weights;
 } TransformerWeights;
 
 typedef struct {
     // current wave of activations
-    float *x; // activation at current time stamp (dim,)
-    float *xb; // same, but inside a residual branch (dim,)
-    float *xb2; // an additional buffer just for convenience (dim,)
-    float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    float* x; // activation at current time stamp (dim,)
+    float* xb; // same, but inside a residual branch (dim,)
+    float* xb2; // an additional buffer just for convenience (dim,)
+    float* hb; // buffer for hidden dimension in the ffn (hidden_dim,)
+    float* hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
     QuantizedTensor xq; // quantized x (dim,)
     QuantizedTensor hq; // quantized hb (hidden_dim,)
-    float *q; // query (dim,)
-    float *k; // key (dim,)
-    float *v; // value (dim,)
-    float *att; // buffer for scores/attention values (n_heads, seq_len)
-    float *logits; // output logits
+    float* q; // query (dim,)
+    float* k; // key (dim,)
+    float* v; // value (dim,)
+    float* att; // buffer for scores/attention values (n_heads, seq_len)
+    float* logits; // output logits
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -89,8 +90,6 @@ typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     TransformerWeights weights; // the weights of the model
     RunState state; // buffers for the "wave" of activations in the forward pass
-    // some more state needed to properly clean up the memory mapping (sigh)
-    int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
@@ -224,44 +223,36 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t sha
     w->wcls = shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
 }
 
-void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
-                     int* fd, float** data, ssize_t* file_size, int ctx_length) {
+void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights, float** data, ssize_t* file_size, int ctx_length) {
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open checkpoint %s\n", checkpoint); exit(EXIT_FAILURE); }
-    // read in magic number (uint32), has to be 0x616b3432, i.e. "ak42" in ASCII
-    uint32_t magic_number;
-    if (fread(&magic_number, sizeof(uint32_t), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (magic_number != 0x616a6331) { fprintf(stderr, "Bad magic number\n"); exit(EXIT_FAILURE); }
-    // read in the version number (uint32), has to be 1
-    int version;
-    if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (version != 1) { fprintf(stderr, "Bad version %d, need version 1\n", version); exit(EXIT_FAILURE); }
-    int header_size = 256; // the header size for version 1 in bytes
-    // read in the Config
-    if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
+
+    fseek(file, 0, SEEK_END); // move file pointer to end of file
+    *file_size = ftell(file); // get the file size, in bytes
+    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
+    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    fclose(file);
+
+    // checkpoint format is 256-byte header, and then the model weights
+
+    memcpy(config, *data, sizeof(Config));
+    if (config->magic_number != 0x616a6331) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(EXIT_FAILURE); }
+    if (config->version != 1) { fprintf(stderr, "Checkpoint %s is version %d, need version 1\n", checkpoint, config->version); exit(EXIT_FAILURE); }
 
     if (ctx_length != 0 && ctx_length <= config->seq_len)
         config->seq_len = ctx_length;
 
-    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, max_position_embeddings=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->group_size);
+    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->group_size);
 
     GS = config->group_size; // set as global, as it will be used in many places
-    // figure out the file size
-    fseek(file, 0, SEEK_END); // move file pointer to end of file
-    *file_size = ftell(file); // get the file size, in bytes
-    fclose(file);
-    // memory map the Transformer weights into the data pointer
-    *fd = open(checkpoint, O_RDONLY); // open in read only mode
-    if (*fd == -1) { fprintf(stderr, "Checkpoint open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    void* weights_ptr = ((char*)*data) + header_size; // skip header bytes. char is 1 byte
+
+    void* weights_ptr = ((char*)*data) + 256; // skip the header (256 bytes)
     memory_map_weights(weights, config, weights_ptr, config->shared_classifier);
 }
 
-void build_transformer(Transformer *t, char* checkpoint_path, int ctx_length) {
+void build_transformer(Transformer* t, char* checkpoint_path, int ctx_length) {
     // read in the Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size, ctx_length);
+    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->data, &t->file_size, ctx_length);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
 }
@@ -280,7 +271,6 @@ void free_transformer(Transformer* t) {
     if(t->weights.wcls != t->weights.q_tokens) { free(t->weights.wcls); }
     // close the memory mapping
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
-    if (t->fd != -1) { close(t->fd); }
     // free the RunState buffers
     free_run_state(&t->state);
 }
@@ -329,18 +319,16 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
 
     #pragma omp parallel for
     for (int i = 0; i < d; i++) {
-
         float val = 0.0f;
-        int32_t ival = 0;
         int in = i * n;
 
         // do the matmul in groups of GS
         for (int j = 0; j <= n - GS; j += GS) {
+            int32_t ival = 0;
             for (int k = 0; k < GS; k++) {
-                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
+                ival += x->q[j + k] * w->q[in + j + k];
             }
             val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-            ival = 0;
         }
 
         xout[i] = val;
@@ -352,7 +340,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
-    float *x = s->x;
+    float* x = s->x;
     int dim = p->dim;
     int kv_dim = p->n_kv_heads * p->head_dim;
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
@@ -378,12 +366,12 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->k, &s->xq, w->wk + l, dim, kv_dim);
         matmul(s->v, &s->xq, w->wv + l, dim, kv_dim);
 
-        float *gq = w->q_ln_weights + l * p->head_dim;   // 128 floats
-        float *gk = w->k_ln_weights + l * p->head_dim;   // 128 floats
+        float* gq = w->q_ln_weights + l * p->head_dim;   // 128 floats
+        float* gk = w->k_ln_weights + l * p->head_dim;   // 128 floats
 
         /* ------------ Q-RMSNorm + rotate each query head ------------- */
         for (int h = 0; h < p->n_heads; h++) {
-            float *q = s->q + h * p->head_dim;
+            float* q = s->q + h * p->head_dim;
 
             rmsnorm(q, q, gq, p->head_dim);
             for (int j = 0; j < p->head_dim/2; j++) {
@@ -400,7 +388,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         /* ------------ K-RMSNorm + rotate each key head ------------ */
         for (int h = 0; h < p->n_kv_heads; h++) {
-            float *k = s->k + h * p->head_dim;
+            float* k = s->k + h * p->head_dim;
 
             rmsnorm(k, k, gk, p->head_dim);
             for (int j = 0; j < p->head_dim/2; j++) {
@@ -515,7 +503,7 @@ typedef struct {
     char system_prompt_template[1024];
 } Tokenizer;
 
-void load_prompt_template(char* checkpoint_path, char *out_template, int with_system_prompt, int enable_thinking) {
+void load_prompt_template(char* checkpoint_path, char* out_template, int with_system_prompt, int enable_thinking) {
     char prompt_path[1024];
 
     strcpy(prompt_path, checkpoint_path);
@@ -553,11 +541,11 @@ void build_tokenizer(Tokenizer* t, char* checkpoint_path, int vocab_size, int en
 
     for (int i = 0; i < vocab_size; i++) {
         if (fread(t->merge_scores + i, sizeof(float), 1, file) != 1) {
-          t->vocab[i] = (char *)malloc(1);
+          t->vocab[i] = (char* )malloc(1);
           t->vocab[i][0] = '\0'; // add the string terminating token
         } else {
           fread(&len, sizeof(int), 1, file);
-          t->vocab[i] = (char *)malloc(len + 1);
+          t->vocab[i] = (char* )malloc(len + 1);
           fread(t->vocab[i], 1, len, file);
           t->vocab[i][len] = '\0'; // add the string terminating token
         }
@@ -578,7 +566,7 @@ char* decode(Tokenizer* t, int token) {
     return t->vocab[token];
 }
 
-int str_lookup(char *str, char **vocab, int vocab_size) {
+int str_lookup(char* str, char* *vocab, int vocab_size) {
     // find a match for str in vocab, return its index or -1 if not found
     for (int i = 0; i < vocab_size; i++) {
         if (!strcmp(str, vocab[i])) {
@@ -588,7 +576,7 @@ int str_lookup(char *str, char **vocab, int vocab_size) {
     return -1;
 }
 
-void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens, int* n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token, eos != 0 means append the EOS token
 
@@ -604,7 +592,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     if (bos) tokens[(*n_tokens)++] = t->bos_token_id;
 
     // process the raw (UTF-8) byte sequence of the input string
-    for (char *c = text; *c != '\0'; c++) {
+    for (char* c = text; *c != '\0'; c++) {
         int id, found_special_token = 0, end_of_token_pos = -1;
 
         // set the buffer to the current byte
@@ -832,8 +820,8 @@ int sample(Sampler* sampler, float* logits) {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-    char *empty_prompt = "";
+void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps) {
+    char* empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
     // encode the (string) prompt into tokens sequence
@@ -890,8 +878,8 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // ----------------------------------------------------------------------------
 // chat loop
 
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-          char *cli_user_prompt, char *system_prompt, int steps) {
+void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
+          char* cli_user_prompt, char* system_prompt, int steps) {
 
     // buffers for reading the system prompt and user prompt from stdin
     char user_prompt[32768];
@@ -986,15 +974,15 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
     // default parameters
-    char *checkpoint_path = NULL;  // e.g. out/model.bin
+    char* checkpoint_path = NULL;  // e.g. out/model.bin
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    char *prompt = NULL;        // prompt string
+    char* prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "chat";        // generate|chat
-    char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
+    char* mode = "chat";        // generate|chat
+    char* system_prompt = NULL; // the (optional) system prompt to use in chat mode
     int enable_thinking = 0;    // 1 enables thinking
     int ctx_length = 0;         // context length
 
