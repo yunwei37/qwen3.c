@@ -578,24 +578,20 @@ int str_lookup(char *str, char **vocab, int vocab_size) {
     return -1;
 }
 
-void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
-    // bos != 0 means prepend the BOS token, eos != 0 means append the EOS token
 
     // create a temporary buffer that will store merge candidates of always two consecutive tokens
     // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
     char *str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
-    char special_token[1024];
+    char special_token[64 + 1];
 
     // start at 0 tokens
     *n_tokens = 0;
 
-    // add optional BOS token, if desired
-    if (bos) tokens[(*n_tokens)++] = t->bos_token_id;
-
     // process the raw (UTF-8) byte sequence of the input string
     for (char *c = text; *c != '\0'; c++) {
-        int id, found_special_token = 0, end_of_token_pos = -1;
+        int id, found_special_token = 0;
 
         // set the buffer to the current byte
         str_buffer[0] = *c;
@@ -605,7 +601,9 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         // and ending with > and there's a token in the vocab for it, use that instead of parsing into
         // shorter tokens
         if (*c == '<') {
-          for (int k = 0; *c != '\0'; k++) {
+          int end_of_token_pos = -1;
+          found_special_token = 0;
+          for (int k = 0; *c != '\0' && k < 64; k++) {
             if (c[k] == '>') {
               end_of_token_pos = k;
               break;
@@ -615,12 +613,12 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
           if (end_of_token_pos != -1) {
             strncpy(special_token, c, end_of_token_pos + 1);
             special_token[end_of_token_pos + 1] = 0;
-          }
 
-          id = str_lookup(special_token, t->vocab, t->vocab_size);
-          if (id != -1) {
-            c += end_of_token_pos;
-            found_special_token = 1;
+            id = str_lookup(special_token, t->vocab, t->vocab_size);
+            if (id != -1) {
+              c += end_of_token_pos;
+              found_special_token = 1;
+            }
           }
         }
 
@@ -669,9 +667,6 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         }
         (*n_tokens)--; // token length decreased
     }
-
-    // add optional EOS token, if desired
-    if (eos) tokens[(*n_tokens)++] = t->eos_token_id;
 
     free(str_buffer);
 }
@@ -829,7 +824,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
     int *prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-    encode(tokenizer, prompt, 0, 0, prompt_tokens, &num_prompt_tokens);
+    encode(tokenizer, prompt, prompt_tokens, &num_prompt_tokens);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "Please provide a prompt using -i <string> on the command line.\n");
         exit(EXIT_FAILURE);
@@ -928,7 +923,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
             }
 
             // encode the rendered prompt into tokens
-            encode(tokenizer, rendered_prompt, 0, 0, prompt_tokens, &num_prompt_tokens);
+            encode(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens);
             user_idx = 0; // reset the user index
             user_turn = 0;
         }
