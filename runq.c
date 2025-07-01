@@ -941,13 +941,10 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
             // otherwise use the next token sampled from previous turn
             token = next;
         }
-        // EOS (=2) token ends the Assistant turn
+        // EOS token ends the Assistant turn
         if (user_idx >= num_prompt_tokens && (token == tokenizer->bos_token_id || token == tokenizer->eos_token_id)) { user_turn = 1; }
 
         // forward the transformer to get logits for the next token
-
-        // printf("|pos=%d token=%d '%s'|\n",pos,token,tokenizer->vocab[token]);
-
         float *logits = forward(transformer, token, pos);
         next = sample(sampler, logits);
         pos++;
