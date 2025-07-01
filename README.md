@@ -87,7 +87,7 @@ Then try:
 
 > What is 19673261 * 1842.64?
 
-## Step 4: explore other models
+## Step 5: explore other models
 
 Try for example DeepSeek-R1-0528-Qwen3-8B:
 
