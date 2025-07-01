@@ -294,9 +294,8 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     for (int j = 0; j < size; j++) {
         ss += x[j] * x[j];
     }
-    ss /= size;
-    ss += 1e-6f;
-    ss = 1.0f / sqrtf(ss);
+    ss = 1.0f / sqrtf((ss / size) + 1e-6f);
+
     // normalize and scale
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
@@ -382,11 +381,11 @@ float* forward(Transformer* transformer, int token, int pos) {
         float *gq = w->q_ln_weights + l * p->head_dim;   // 128 floats
         float *gk = w->k_ln_weights + l * p->head_dim;   // 128 floats
 
-        /* ------------ QK-RMSNorm + rotate each QUERY head --------------------------------- */
+        /* ------------ Q-RMSNorm + rotate each query head ------------- */
         for (int h = 0; h < p->n_heads; h++) {
-            rmsnorm(s->q + h * p->head_dim, s->q + h * p->head_dim, gq, p->head_dim);
-
             float *q = s->q + h * p->head_dim;
+
+            rmsnorm(q, q, gq, p->head_dim);
             for (int j = 0; j < p->head_dim/2; ++j) {
                 float freq = pow(1e6, -(double)j / (p->head_dim/2));
                 float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
@@ -399,11 +398,11 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
-        /* ------------ QK-RMSNorm + rotate each unique KV head once ------------------------ */
+        /* ------------ K-RMSNorm + rotate each unique key head ------------ */
         for (int h = 0; h < p->n_kv_heads; h++) {
-            rmsnorm(s->k + h * p->head_dim, s->k + h * p->head_dim, gk, p->head_dim);
-
             float *k = s->k + h * p->head_dim;
+
+            rmsnorm(k, k, gk, p->head_dim);
             for (int j = 0; j < p->head_dim/2; ++j) {
                 float freq = pow(1e6, -(double)j / (p->head_dim/2));
                 float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
