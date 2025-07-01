@@ -386,8 +386,8 @@ float* forward(Transformer* transformer, int token, int pos) {
             float *q = s->q + h * p->head_dim;
 
             rmsnorm(q, q, gq, p->head_dim);
-            for (int j = 0; j < p->head_dim/2; ++j) {
-                float freq = pow(1e6, -(double)j / (p->head_dim/2));
+            for (int j = 0; j < p->head_dim/2; j++) {
+                float freq = powf(1e6, -(float)j / (p->head_dim/2));
                 float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
 
                 float x = q[j]; // real part
@@ -398,13 +398,13 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
-        /* ------------ K-RMSNorm + rotate each unique key head ------------ */
+        /* ------------ K-RMSNorm + rotate each key head ------------ */
         for (int h = 0; h < p->n_kv_heads; h++) {
             float *k = s->k + h * p->head_dim;
 
             rmsnorm(k, k, gk, p->head_dim);
-            for (int j = 0; j < p->head_dim/2; ++j) {
-                float freq = pow(1e6, -(double)j / (p->head_dim/2));
+            for (int j = 0; j < p->head_dim/2; j++) {
+                float freq = powf(1e6, -(float)j / (p->head_dim/2));
                 float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
 
                 float x = k[j];
