@@ -229,8 +229,14 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weigh
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open checkpoint %s\n", checkpoint); exit(EXIT_FAILURE); }
 
-    fseek(file, 0, SEEK_END); // move file pointer to end of file
-    *file_size = ftell(file); // get the file size, in bytes
+    #if defined _WIN32
+      _fseeki64(file, 0, SEEK_END); // move file pointer to end of file
+      *file_size = _ftelli64(file); // get the file size, in bytes
+    #else
+      fseek(file, 0, SEEK_END); // move file pointer to end of file
+      *file_size = ftell(file); // get the file size, in bytes
+    #endif
+
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     fclose(file);
@@ -849,13 +855,13 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         }
         pos++;
 
-        // data-dependent terminating condition: the BOS token delimits sequences
-        if (pos >= num_prompt_tokens && (next == tokenizer->bos_token_id || next == tokenizer->eos_token_id)) { break; }
-
         // print the token as string, decode it with the Tokenizer object
         printf("%s", decode(tokenizer, token));
         fflush(stdout);
         token = next;
+
+        // data-dependent terminating condition: the BOS token delimits sequences
+        if (pos >= num_prompt_tokens && (next == tokenizer->bos_token_id || next == tokenizer->eos_token_id)) { break; }
     }
     printf("\n");
     free(prompt_tokens);
