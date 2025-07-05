@@ -36,23 +36,20 @@ make openmp
 
 ## Step 2: download and convert a model
 
-First, make sure `git` is set up with your HuggingFace credentials (now is a great time to create a
-HuggingFace account if you don't have one).
-
-Then, download any dense (no Mixture-of-Experts) unquantized (not GGUF) Qwen3-architecture model from HuggingFace.
-Unless you have lots of RAM, start with smaller models.
-
-Qwen3-4B is a great starting point:
+Install any needed Python dependencies for the HuggingFace export utility:
 
 ```aiignore
-git clone https://huggingface.co/Qwen/Qwen3-4B
+pip install -r requirements.txt
 ```
 
-Then run the Python 3 export tool (will take around 10 minutes) to convert to qwen3.c's quantized checkpoint format, storing in
+Then, pick any dense (no Mixture-of-Experts) unquantized (not GGUF) Qwen3-architecture model from HuggingFace.
+Unless you have lots of RAM, start with smaller models. `Qwen/Qwen3-4B` is great, so we'll start with that.
+
+Run the Python 3 export tool (will take around 10 minutes) to download the model from HuggingFace and convert to qwen3.c's quantized checkpoint format, storing in
 a file called `Qwen3-4B.bin`:
 
 ```aiignore
-python export.py Qwen3-4B.bin ./Qwen3-4B
+python export.py Qwen3-4B.bin Qwen/Qwen3-4B
 ```
 
 ## Step 3: run and enjoy
@@ -89,11 +86,10 @@ Then try:
 
 ## Step 5: explore other models
 
-Try for example DeepSeek-R1-0528-Qwen3-8B:
+Try for example `DeepSeek-R1-0528-Qwen3-8B`:
 
 ```aiignore
-git clone https://huggingface.co/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
-python export.py DeepSeek-R1-0528-Qwen3-8B.bin ./DeepSeek-R1-0528-Qwen3-8B
+python export.py DeepSeek-R1-0528-Qwen3-8B.bin deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
 ```
 
 Then:
