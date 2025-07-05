@@ -1,18 +1,11 @@
 """
-This script has functions and utilties for model export.
-Basically, we have a bunch of versions of the model, and we
-want to export them to .bin files to be read from and inferenced in C.
+This script has functions and utilities for model export.
 
-Among the "input" versions of PyTorch files/models:
-- Official Llama 2 weights released by Meta
-- Huggingface weights available on the hub
-- llama2.c (this repo) trained models
+Input:
+- HuggingFace weights for any unquantized Qwen3-architecture model
 
-Among the "output" versions of .bin files:
-- v0: Legacy files of the original llama2.c repo (will eventually be DEPRECATED)
-- v1-vN: Improved .bin files with a proper header, cache alignment, etc.
-
-This script aspires to provide all of these conversions.
+Output:
+- Checkpoint file (quantized to Q8_0) compatible with qwen3.c
 """
 
 import argparse
@@ -149,11 +142,11 @@ def model_export(model, filepath, group_size=64):
         serialize_fp32(out_file, layer.ffn_norm.weight)
     serialize_fp32(out_file, model.norm.weight)  # final pre-classifier norm
 
-    # write out the QK-LayerNorm weights (Qwen3)
+    # write out the QK-RMSNorm weights (Qwen3)
     for layer in model.layers:
-        serialize_fp32(out_file, layer.attention.lq.weight if layer.attention.lq.weight is not None else torch.ones(config.head_dim))
+        serialize_fp32(out_file, layer.attention.lq.weight)
     for layer in model.layers:
-        serialize_fp32(out_file, layer.attention.lk.weight if layer.attention.lk.weight is not None else torch.ones(config.head_dim))
+        serialize_fp32(out_file, layer.attention.lk.weight)
 
     # now let's write out all the params that we are quantizing to Q8_0
     # note we skip classifier weights, which are shared with the embedding
@@ -213,11 +206,7 @@ def build_tokenizer(model, file):
     id_to_token = {v: k for k, v in vocab.items()}
     all_tokens = [id_to_token[i] for i in sorted(id_to_token)]
 
-    tokenizer_path = Path(tokenizer.name_or_path)
-    tokenizer_json_path = tokenizer_path / "tokenizer.json"
-
-    with open(tokenizer_json_path, "r", encoding="utf-8") as f:
-        tokenizer_data = json.load(f)
+    tokenizer_data = json.loads(tokenizer.backend_tokenizer.to_str())
 
     # Extract vocab and merge rules
     vocab = tokenizer_data["model"]["vocab"]
@@ -310,18 +299,15 @@ def load_hf_model(model_path):
     # convert config to ModelArgs
     config = ModelArgs()
 
-    with open(os.path.join(model_path, 'config.json'), 'r') as f:
-        config_json = json.load(f)
-
-    config.dim = config_json["hidden_size"]
-    config.n_layers = config_json["num_hidden_layers"]
-    config.n_heads = config_json["num_attention_heads"]
-    config.n_kv_heads = config_json["num_key_value_heads"]
-    config.vocab_size = config_json["vocab_size"]
-    config.hidden_dim = config_json["intermediate_size"]
-    config.norm_eps = config_json["rms_norm_eps"]
-    config.max_seq_len = config_json["max_position_embeddings"]
-    config.head_dim = config_json.get("head_dim", config.dim // config.n_heads)
+    config.dim = hf_model.config.hidden_size
+    config.n_layers = hf_model.config.num_hidden_layers
+    config.n_heads = hf_model.config.num_attention_heads
+    config.n_kv_heads = hf_model.config.num_key_value_heads
+    config.vocab_size = hf_model.config.vocab_size
+    config.hidden_dim = hf_model.config.intermediate_size
+    config.norm_eps = hf_model.config.rms_norm_eps
+    config.max_seq_len = hf_model.config.max_position_embeddings
+    config.head_dim = hf_model.config.head_dim if hasattr(hf_model.config, "head_dim") else config.dim // config.n_heads
 
     print(config)
 
@@ -332,8 +318,8 @@ def load_hf_model(model_path):
     model.norm.weight = nn.Parameter(hf_dict["model.norm.weight"])
 
     model.tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model.bos_token_id = config_json.get("bos_token_id", 0)
-    model.eos_token_id = config_json.get("eos_token_id", 0)
+    model.bos_token_id = hf_model.config.bos_token_id if hasattr(hf_model.config, "bos_token_id") else 0
+    model.eos_token_id = hf_model.config.eos_token_id if hasattr(hf_model.config, "eos_token_id") else 0
 
     for layer in model.layers:
         i = layer.layer_id
@@ -386,14 +372,6 @@ if __name__ == "__main__":
     parser.add_argument("filepath", type=str, help="the output filepath")
     parser.add_argument("hfpath", type=str, help="huggingface model path")
     args = parser.parse_args()
-
-    if args.filepath is None or args.hfpath is None:
-        print("Usage: export.py <output.bin> <huggingface_input_path>")
-        print("")
-        print("e.g.   git clone https://huggingface.co/Qwen/Qwen3-4B")
-        print("       export.py Qwen3-4B.bin Qwen/Qwen3-4B")
-        print("")
-        exit(0)
 
     model = load_hf_model(args.hfpath)
 
