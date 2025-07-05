@@ -2,7 +2,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <stdint.h>
 #include <time.h>
 #include <math.h>
@@ -18,6 +17,9 @@
 // ----------------------------------------------------------------------------
 // Globals
 int GS = 0; // group size global for quantization of the weights
+
+// Maximum input prompt buffer size
+#define PROMPT_BUFFER_SIZE 32768
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -55,8 +57,8 @@ typedef struct {
     QuantizedTensor *wv; // (layer, dim, n_kv_heads * head_size)
     QuantizedTensor *wo; // (layer, n_heads * head_size, dim)
     // QK-RMSNorm for Qwen3
-    float *q_ln_weights;
-    float *k_ln_weights;
+    float *q_norm_weights;
+    float *k_norm_weights;
     // weights for ffn
     QuantizedTensor *w1; // (layer, hidden_dim, dim)
     QuantizedTensor *w2; // (layer, dim, hidden_dim)
@@ -71,7 +73,6 @@ typedef struct {
     // current wave of activations
     float *x; // activation at current time stamp (dim,)
     float *xb; // same, but inside a residual branch (dim,)
-    float *xb2; // an additional buffer just for convenience (dim,)
     float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
     float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
     QuantizedTensor xq; // quantized x (dim,)
@@ -101,7 +102,6 @@ void malloc_run_state(RunState* s, Config *p) {
 
     s->x = calloc(p->dim, sizeof(float));
     s->xb = calloc(all_heads_dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
     s->hb = calloc(p->hidden_dim, sizeof(float));
     s->hb2 = calloc(p->hidden_dim, sizeof(float));
     s->xq = (QuantizedTensor) { .q = calloc(all_heads_dim, sizeof(int8_t)), .s = calloc(all_heads_dim / GS, sizeof(float)) };
@@ -113,9 +113,7 @@ void malloc_run_state(RunState* s, Config *p) {
     s->value_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
 
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->att || !s->logits || !s->key_cache
-     || !s->value_cache) {
+    if (!s->x || !s->xb || !s->hb || !s->hb2 || !s->q || !s->att || !s->logits || !s->key_cache || !s->value_cache) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -124,7 +122,6 @@ void malloc_run_state(RunState* s, Config *p) {
 void free_run_state(RunState* s) {
     free(s->x);
     free(s->xb);
-    free(s->xb2);
     free(s->hb);
     free(s->hb2);
     free(s->xq.q);
@@ -147,10 +144,7 @@ void dequantize(QuantizedTensor *qx, float *x, int n) {
 }
 
 void quantize(QuantizedTensor *qx, float *x, int n) {
-    int num_groups = n / GS;
-    float Q_MAX = 127.0f;
-
-    for (int group = 0; group < num_groups; group++) {
+    for (int group = 0; group < n / GS; group++) {
         // find the max absolute value in the current group
         float wmax = 0;
         for (int i = 0; i < GS; i++) {
@@ -160,7 +154,7 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
         }
 
         // calculate and write the scaling factor
-        float scale = wmax / Q_MAX;
+        float scale = wmax / 127.0f;
         qx->s[group] = scale;
 
         // calculate and write the quantized values
@@ -174,18 +168,16 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
 
 /* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
 QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
-    void *p = *ptr;
     QuantizedTensor *res = malloc(n * sizeof(QuantizedTensor));
 
     for (int i = 0; i < n; i++) {
-        /* map quantized int8 values*/
-        res[i].q = (int8_t*)p;
-        p = (int8_t*)p + size_each;
-        /* map scale factors */
-        res[i].s = (float*)p;
-        p = (float*)p + size_each / GS;
+        // map quantized int8 values
+        res[i].q = (int8_t*)*ptr;
+        *ptr = (int8_t*)*ptr + size_each;
+        // map scale factors
+        res[i].s = (float*)*ptr;
+        *ptr = (float*)*ptr + size_each / GS;
     }
-    *ptr = p; // advance ptr to current position
     return res;
 }
 
@@ -199,9 +191,9 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
     fptr += p->n_layers * p->dim;
     w->rms_final_weight = fptr;
     fptr += p->dim;
-    w->q_ln_weights = fptr;
+    w->q_norm_weights = fptr;
     fptr += p->n_layers * p->head_dim;
-    w->k_ln_weights = fptr;
+    w->k_norm_weights = fptr;
     fptr += p->n_layers * p->head_dim;
 
     // now read all the quantized weights
@@ -338,18 +330,15 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
-    // a few convenience variables
     Config *p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
-    float *x = s->x;
-    int dim = p->dim;
     int kv_dim = p->n_kv_heads * p->head_dim;
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
-    int hidden_dim =  p->hidden_dim;
     int all_heads_dim = p->n_heads * p->head_dim;
-    // copy the token embedding into x
-    memcpy(x, w->token_embedding_table + token*dim, dim * sizeof(float));
+
+    // copy the token embedding into s->x
+    memcpy(s->x, w->token_embedding_table + token * p->dim, p->dim * sizeof(float));
 
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
@@ -360,22 +349,19 @@ float *forward(Transformer *transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        rmsnorm(s->xb, s->x, w->rms_att_weight + l * p->dim, p->dim);
 
         // qkv matmuls for this position
-        quantize(&s->xq, s->xb, dim);
-        matmul(s->q, &s->xq, w->wq + l, dim, all_heads_dim);
-        matmul(s->k, &s->xq, w->wk + l, dim, kv_dim);
-        matmul(s->v, &s->xq, w->wv + l, dim, kv_dim);
-
-        float *gq = w->q_ln_weights + l * p->head_dim;   // 128 floats
-        float *gk = w->k_ln_weights + l * p->head_dim;   // 128 floats
+        quantize(&s->xq, s->xb, p->dim);
+        matmul(s->q, &s->xq, w->wq + l, p->dim, all_heads_dim);
+        matmul(s->k, &s->xq, w->wk + l, p->dim, kv_dim);
+        matmul(s->v, &s->xq, w->wv + l, p->dim, kv_dim);
 
         /* ------------ Q-RMSNorm + rotate each query head ------------- */
         for (int h = 0; h < p->n_heads; h++) {
             float *q = s->q + h * p->head_dim;
 
-            rmsnorm(q, q, gq, p->head_dim);
+            rmsnorm(q, q, w->q_norm_weights + l * p->head_dim, p->head_dim);
             for (int j = 0; j < p->head_dim/2; j++) {
                 float freq = powf(1e6, -(float)j / (p->head_dim/2));
                 float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
@@ -392,7 +378,7 @@ float *forward(Transformer *transformer, int token, int pos) {
         for (int h = 0; h < p->n_kv_heads; h++) {
             float *k = s->k + h * p->head_dim;
 
-            rmsnorm(k, k, gk, p->head_dim);
+            rmsnorm(k, k, w->k_norm_weights + l * p->head_dim, p->head_dim);
             for (int j = 0; j < p->head_dim/2; j++) {
                 float freq = powf(1e6, -(float)j / (p->head_dim/2));
                 float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
@@ -434,56 +420,49 @@ float *forward(Transformer *transformer, int token, int pos) {
             for (int t = 0; t <= pos; t++) {
                 // get the value vector for this head and at this timestep
                 float *v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * p->head_dim;
-                // get the attention weight for this timestep
-                float a = att[t];
-                // accumulate the weighted value into xb
+                // get the attention weight for this timestep, then accumulate the weighted value into xb
                 for (int i = 0; i < p->head_dim; i++)
-                    xb[i] += a * v[i];
+                    xb[i] += att[t] * v[i];
             }
         }
 
         // final matmul to get the output of the attention
         quantize(&s->xq, s->xb, all_heads_dim);
-        matmul(s->xb2, &s->xq, w->wo + l, all_heads_dim, dim);
+        matmul(s->xb, &s->xq, w->wo + l, all_heads_dim, p->dim);
 
-        // residual connection back into x
-        for (int i = 0; i < dim; i++)
-            x[i] += s->xb2[i];
+        // residual connection back into s->x
+        for (int i = 0; i < p->dim; i++)
+            s->x[i] += s->xb[i];
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        rmsnorm(s->xb, s->x, w->rms_ffn_weight + l * p->dim, p->dim);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        quantize(&s->xq, s->xb, dim);
-        matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim);
-        matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim);
+        quantize(&s->xq, s->xb, p->dim);
+        matmul(s->hb, &s->xq, w->w1 + l, p->dim, p->hidden_dim);
+        matmul(s->hb2, &s->xq, w->w3 + l, p->dim, p->hidden_dim);
 
         // SwiGLU non-linearity
-        for (int i = 0; i < hidden_dim; i++) {
-            float val = s->hb[i];
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= (1.0f / (1.0f + expf(-val)));
-            // elementwise multiply with w3(x)
-            val *= s->hb2[i];
-            s->hb[i] = val;
-        }
+        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        for (int i = 0; i < p->hidden_dim; i++)
+            s->hb[i] *= s->hb2[i] * (1.0f / (1.0f + expf(-s->hb[i])));
 
         // final matmul to get the output of the ffn
-        quantize(&s->hq, s->hb, hidden_dim);
-        matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim);
+        quantize(&s->hq, s->hb, p->hidden_dim);
+        matmul(s->xb, &s->hq, w->w2 + l, p->hidden_dim, p->dim);
 
         // residual connection
-        for (int i = 0; i < dim; i++)
-            x[i] += s->xb[i];
+        for (int i = 0; i < p->dim; i++)
+            s->x[i] += s->xb[i];
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
+    rmsnorm(s->x, s->x, w->rms_final_weight, p->dim);
 
     // classifier into logits
-    quantize(&s->xq, x, dim);
-    matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+    quantize(&s->xq, s->x, p->dim);
+    matmul(s->logits, &s->xq, w->wcls, p->dim, p->vocab_size);
     return s->logits;
 }
 
@@ -540,12 +519,12 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
     for (int i = 0; i < vocab_size; i++) {
         if (fread(t->merge_scores + i, sizeof(float), 1, file) != 1) {
             t->vocab[i] = (char *)malloc(1);
-            t->vocab[i][0] = '\0'; // add the string terminating token
+            t->vocab[i][0] = 0; // add the string terminating token
         } else {
             fread(&len, sizeof(int), 1, file);
             t->vocab[i] = (char *)malloc(len + 1);
             fread(t->vocab[i], 1, len, file);
-            t->vocab[i][len] = '\0'; // add the string terminating token
+            t->vocab[i][len] = 0; // add the string terminating token
         }
     }
     fclose(file);
@@ -585,12 +564,12 @@ void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
     *n_tokens = 0;
 
     // process the raw (UTF-8) byte sequence of the input string
-    for (char *c = text; *c != '\0'; c++) {
+    for (char *c = text; *c != 0; c++) {
         int id, found_special_token = 0;
 
         // set the buffer to the current byte
         str_buffer[0] = *c;
-        str_buffer[1] = '\0';
+        str_buffer[1] = 0;
 
         // special tokens begin with < and end with >. If we find a substring beginning with <
         // and ending with > and there's a token in the vocab for it, use that instead of parsing into
@@ -598,7 +577,7 @@ void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
         if (*c == '<') {
           int end_of_token_pos = -1;
           found_special_token = 0;
-          for (int k = 0; *c != '\0' && k < 64; k++) {
+          for (int k = 0; *c != 0 && k < 64; k++) {
               if (c[k] == '>') {
                   end_of_token_pos = k;
                   break;
@@ -782,13 +761,12 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
 
 int sample(Sampler *sampler, float *logits) {
     // sample the token given the logits and some hyperparameters
-    int next;
     if (sampler->temperature == 0) {
         // greedy argmax sampling: take the token with the highest probability
-        next = sample_argmax(logits, sampler->vocab_size);
+        return sample_argmax(logits, sampler->vocab_size);
     } else {
         // apply the temperature to the logits
-        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
+        for (int q = 0; q < sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
         // apply softmax to the logits to get the probabilities for next token
         softmax(logits, sampler->vocab_size);
         // flip a (float) coin (this is our source of entropy for sampling)
@@ -796,13 +774,12 @@ int sample(Sampler *sampler, float *logits) {
         // we sample from this distribution to get the next token
         if (sampler->topp <= 0 || sampler->topp >= 1) {
             // simply sample from the predicted probability distribution
-            next = sample_mult(logits, sampler->vocab_size, coin);
+            return sample_mult(logits, sampler->vocab_size, coin);
         } else {
             // top-p (nucleus) sampling, clamping the least likely tokens to zero
-            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+            return sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
         }
     }
-    return next;
 }
 
 // ----------------------------------------------------------------------------
@@ -859,7 +836,7 @@ void read_stdin(const char *guide, char *buffer, size_t bufsize) {
     if (fgets(buffer, bufsize, stdin) != NULL) {
         size_t len = strlen(buffer);
         if (len > 0 && buffer[len - 1] == '\n')
-            buffer[len - 1] = '\0'; // strip newline
+            buffer[len - 1] = 0; // strip newline
     }
 }
 
@@ -868,17 +845,15 @@ void read_stdin(const char *guide, char *buffer, size_t bufsize) {
 
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *cli_user_prompt, char *system_prompt) {
     // buffers for reading the system prompt and user prompt from stdin
-    char user_prompt[32768];
-    char rendered_prompt[32768];
+    char user_prompt[PROMPT_BUFFER_SIZE];
+    char rendered_prompt[PROMPT_BUFFER_SIZE];
     int num_prompt_tokens = 0;
-    int *prompt_tokens = (int *)malloc(32768 * sizeof(int));
-    int user_idx;
+    int *prompt_tokens = (int *)malloc(PROMPT_BUFFER_SIZE * sizeof(int));
 
     // start the main loop
-    int8_t user_turn = 1; // user starts
+    int user_turn = 1; // user starts
     int next;        // will store the next token in the sequence
     int token;       // stores the current token to feed into the transformer
-    int prev_token;
     int pos = 0;     // position in the sequence
 
     while (1) {
@@ -913,28 +888,25 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
 
             // encode the rendered prompt into tokens
             encode(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens);
-            user_idx = 0; // reset the user index
+            pos = 0; // reset the user index
             user_turn = 0;
         }
 
         // determine the token to pass into the transformer next
-        if (user_idx < num_prompt_tokens) {
+        if (pos < num_prompt_tokens) {
             // if we are still processing the input prompt, force the next prompt token
-            token = prompt_tokens[user_idx++];
+            token = prompt_tokens[pos];
         } else {
             // otherwise use the next token sampled from previous turn
             token = next;
         }
 
-        // printf("|pos=%d token=%d '%s'|\n",pos,token,tokenizer->vocab[token]);
-
         // forward the transformer to get logits for the next token
-        float *logits = forward(transformer, token, pos);
+        float *logits = forward(transformer, token, pos++);
         next = sample(sampler, logits);
-        pos++;
 
         // assistant is responding
-        if (user_idx >= num_prompt_tokens) {
+        if (pos >= num_prompt_tokens) {
             if (token == tokenizer->bos_token_id || token == tokenizer->eos_token_id) {
                 // EOS token ends the assistant turn
                 printf("\n");
