@@ -1,0 +1,27 @@
+# Compiled binaries
+runq
+runq_int8
+runq.exe
+
+# Model files
+*.bin
+*.bin.template
+*.bin.template.*
+*.bin.tokenizer
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
